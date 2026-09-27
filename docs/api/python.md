@@ -122,6 +122,43 @@ actually covers. A symbol too long to embed in one piece is indexed as several
 chunks that all carry its line range, so `content_start_line` can be later than
 the result's `start_line`.
 
+### Batch search
+
+`vexor.search_many(...)` and `VexorClient.search_many(...)` accept the same
+keyword arguments as `search(...)`, with a sequence of query strings in place
+of `query`. They return a `list[SearchResponse]` in input order:
+
+```python
+from vexor import VexorClient
+
+queries = ["where passwords are validated", "how database transactions commit"]
+with VexorClient() as client:
+    responses = client.search_many(queries, path=".", mode="code", include_content=True)
+    for query, response in zip(queries, responses):
+        print(query, [(hit.path, hit.content) for hit in response.results])
+```
+
+The batch prepares the index once and embeds uncached unique queries together.
+Provider `batch_size` and `embed_concurrency` still control request splitting.
+Ranking follows `search`; rerankers run per query. `content_chars_total` applies
+separately to each response.
+
+Input and failure contracts:
+
+- Pass a list, tuple, or other sequence of strings that are non-empty after
+  trimming whitespace. Bare strings and generators are rejected. Invalid input raises
+  `VexorError` before indexing or contacting a provider.
+- An empty sequence returns `[]` without resolving config, paths, or models.
+- Duplicate queries retain their positions and have independent result objects.
+- [Provider](../configuration.md#providers-remote-vs-local) or reranker errors
+  raise without returning partial results. Completed indexing and cache writes
+  are retained.
+
+`InMemoryIndex.search_many(...)` accepts the options of `InMemoryIndex.search(...)`
+and defaults to `no_cache=True`. File batches with `temporary_index` or `no_cache`
+build the temporary index once per call.
+For caller-owned records, see [collection batches](collections.md#batch-search).
+
 ### index(...)
 
 Build or refresh the index for a directory. Accepts the same indexing and config

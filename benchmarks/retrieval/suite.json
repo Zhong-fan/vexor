@@ -55,7 +55,7 @@
       "evidence": [
         {
           "path": "vexor/services/collection_service.py",
-          "anchor": "candidate_ids = collection_store.resolve_filter_ids(info.id, filters, snapshot)\n        if not candidate_ids:\n            return []\n        record_ids, matrix = collection_store.load_vectors("
+          "anchor": "candidate_ids = collection_store.resolve_filter_ids(info.id, filters, snapshot)\n        if not candidate_ids:\n            return [[] for _ in queries]\n        record_ids, matrix = collection_store.load_vectors("
         }
       ]
     },
@@ -67,7 +67,7 @@
       "evidence": [
         {
           "path": "vexor/services/collection_service.py",
-          "anchor": "# Model loading and remote calls can be slow, so rerank only after the read\n    # snapshot closes instead of pinning the collection WAL for their duration."
+          "anchor": "# No provider or model calls while a read transaction pins the WAL.\n    return [\n        _rerank_candidates("
         }
       ]
     },

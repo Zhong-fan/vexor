@@ -102,6 +102,30 @@ therefore tracks the size of one filtered slice. Without a filter, that slice
 is the entire collection, so use selective metadata such as a chat, tenant, or
 time boundary when the application naturally has one.
 
+## Batch search
+
+`CollectionHandle.search_many(queries, ...)` accepts the options of `search()`
+and returns a `list[list[RecordResult]]` in query order:
+
+```python
+from vexor import VexorClient
+
+with VexorClient() as client:
+    messages = client.collection("chat-history")
+    results_by_query = messages.search_many(
+        ["Why did deployment fail?", "How was it fixed?"],
+        filters={"chat_id": "chat-7"},
+        rerank="hybrid",
+    )
+```
+
+Queries share filter and ranking options and read from one collection snapshot,
+so concurrent writes do not change results partway through the batch.
+
+The [batch input and failure rules](python.md#batch-search) also apply here.
+An empty filtered subset returns one empty list per query. The handle's
+`no_cache` setting applies to all query embeddings.
+
 ## Worked example: database-backed chat history
 
 The application keeps the messages in its database and uses the message or turn

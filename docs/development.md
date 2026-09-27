@@ -43,6 +43,20 @@ The harness reports first and process-cached vector loads, full snapshot
 validation, and event-backed freshness checks. Timing is diagnostic evidence,
 not a fixed CI threshold.
 
+Compare batch and repeated single-query retrieval with a real local model:
+
+```bash
+uv sync --extra local
+uv run --extra local python scripts/benchmark_batch_search.py
+```
+
+The benchmark checks result equivalence on synthetic documents: files and filtered
+collections use `off` and `hybrid`; in-memory search uses `hybrid`. It reports
+embedding calls and elapsed time with cold query caches, excluding initial
+indexing and model warmup. Per-search model initialization remains included.
+Use `--model` to select a model; download it before setting `HF_HUB_OFFLINE=1`
+for an offline run. Timing is diagnostic, not a CI or retrieval-quality gate.
+
 Ranking changes are argued with numbers, not intuition. Two scripts score the
 same 30-query set in `scripts/eval_queries.jsonl` against whatever provider the
 config resolves to, and report MRR@10, Hit@1, and Hit@5:

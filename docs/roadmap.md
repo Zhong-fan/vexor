@@ -108,8 +108,6 @@ never leaving the machine.
     concurrency to reduce thread overhead and improve connection reuse.
   - Adaptive embedding batch size for remote providers (guarded by safe
     min/max and backoff on 429/413).
-  - Batch query search API to embed multiple queries per call. Client sessions
-    already reuse loaded index vectors; batching still reduces provider calls.
 
 ## P2 — Coverage & polish
 
@@ -172,6 +170,10 @@ never leaving the machine.
 
 ## Engineering TODO
 
+- Validate the assembled batch, including cache hits, in
+  [`embed_texts_with_cache`](../vexor/services/embedding_service.py). Cover cached
+  non-finite values and incompatible vector widths in full-hit and mixed-hit
+  regression tests for indexing and collection upserts.
 - Add a dev-only consistency test that validates the MCP tool
   `inputSchema` against the server-side argument validation (feed
   known-good/bad payloads through both), so the advertised schema and the
