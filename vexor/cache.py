@@ -616,6 +616,7 @@ def _write_vector_file(
 
 
 def _require_vector_file(db_path: Path, stored_path: str) -> Path:
+    """Resolve a committed sidecar, reporting damage rather than an absent index."""
     vector_path = _resolve_vector_file(db_path, stored_path)
     if not vector_path.is_file():
         raise DamagedIndexError(
@@ -631,6 +632,7 @@ def _load_vector_file(
     rows: int,
     dimension: int,
 ) -> np.ndarray:
+    """Load a sidecar and reject missing files, invalid arrays, or shape mismatches."""
     vector_path = _require_vector_file(db_path, stored_path)
     try:
         mmap_mode = None if rows == 0 else "r"
@@ -806,6 +808,7 @@ def store_index(
     exclude_patterns: Sequence[str] | None = None,
     extensions: Sequence[str] | None = None,
 ) -> Path:
+    """Publish a full generation under the same SQLite write lock used by pruning."""
     db_path = cache_file(root, model, include_hidden)
     conn = _connect(db_path)
     vector_file = ""
@@ -1271,6 +1274,7 @@ def load_index(
     *,
     respect_gitignore: bool = True,
 ) -> dict:
+    """Read index metadata and chunk details, rejecting missing committed sidecars."""
     db_path = cache_file(root, model, include_hidden)
     if not db_path.exists():
         raise FileNotFoundError(db_path)
@@ -1312,10 +1316,12 @@ def load_index(
         if version < CACHE_VERSION:
             raise FileNotFoundError(db_path)
 
-        vector_file = conn.execute(
+        vector_row = conn.execute(
             "SELECT vector_file FROM index_metadata WHERE id = ?", (meta["id"],)
-        ).fetchone()["vector_file"]
-        _require_vector_file(db_path, str(vector_file))
+        ).fetchone()
+        if vector_row is None:
+            raise FileNotFoundError(db_path)
+        _require_vector_file(db_path, str(vector_row["vector_file"]))
 
         rows = conn.execute(
             """
@@ -1395,6 +1401,7 @@ def load_index_vectors(
     respect_gitignore: bool = True,
     memory_cache: IndexVectorCache | None = None,
 ):
+    """Load immutable vectors, validating sidecar presence even on a memory-cache hit."""
     db_path = cache_file(root, model, include_hidden)
     if not db_path.exists():
         raise FileNotFoundError(db_path)

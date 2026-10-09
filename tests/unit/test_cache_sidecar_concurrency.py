@@ -13,6 +13,7 @@ from vexor.services.cache_service import load_index_metadata_safe
 
 
 def _options(root: Path) -> dict:
+    """Use identical index settings across writer and reader processes."""
     return {
         "root": root,
         "model": "model",
@@ -23,15 +24,18 @@ def _options(root: Path) -> dict:
 
 
 def _entry(root: Path, value: float) -> cache.IndexedChunk:
+    """Create one vector row whose value distinguishes index generations."""
     return cache.IndexedChunk(root / "a.txt", "a.txt", 0, "text", [value, 1.0])
 
 
 def _write_paused(cache_dir, root, incremental, stage, paused, release):
+    """Hold a writer at a sidecar publication stage until the parent releases it."""
     with cache.cache_dir_context(cache_dir):
         if stage == "temporary":
             original = cache.np.lib.format.open_memmap
 
             def pause(*args, **kwargs):
+                """Pause after the temporary mmap exists but before its rows are written."""
                 result = original(*args, **kwargs)
                 if kwargs.get("mode") == "w+":
                     paused.set()
@@ -44,6 +48,7 @@ def _write_paused(cache_dir, root, incremental, stage, paused, release):
             original = cache._write_vector_file
 
             def pause(*args, **kwargs):
+                """Pause after the final sidecar exists but before metadata is committed."""
                 result = original(*args, **kwargs)
                 paused.set()
                 if not release.wait(10):
@@ -63,6 +68,7 @@ def _write_paused(cache_dir, root, incremental, stage, paused, release):
 
 
 def _read_and_prune(cache_dir, root, started, finished):
+    """Load a peer index while its memory-cache path attempts orphan cleanup."""
     with cache.cache_dir_context(cache_dir):
         started.set()
         cache.load_index_vectors(
@@ -74,6 +80,7 @@ def _read_and_prune(cache_dir, root, started, finished):
 @pytest.mark.parametrize("incremental", [False, True])
 @pytest.mark.parametrize("stage", ["temporary", "final"])
 def test_pruning_preserves_other_process_pending_generation(tmp_path, incremental, stage):
+    """Force cleanup during pending publication and verify both committed generations."""
     cache_dir = tmp_path / "shared-cache"
     roots = [tmp_path / "a", tmp_path / "b"]
     for root in roots:
@@ -127,6 +134,7 @@ def test_pruning_preserves_other_process_pending_generation(tmp_path, incrementa
 
 
 def test_healthy_memory_cache_read_defers_cleanup_under_write_lock(tmp_path):
+    """Keep reads usable under contention and clean abandoned files after lock release."""
     root = tmp_path / "project"
     root.mkdir()
     (root / "a.txt").write_text("text", encoding="utf-8")
@@ -151,6 +159,7 @@ def test_healthy_memory_cache_read_defers_cleanup_under_write_lock(tmp_path):
 
 
 def test_readonly_database_can_load_into_memory_cache(tmp_path, monkeypatch):
+    """Allow valid reads when opportunistic cleanup cannot obtain write permission."""
     root = tmp_path / "project"
     root.mkdir()
     (root / "a.txt").write_text("text", encoding="utf-8")
@@ -168,6 +177,7 @@ def test_readonly_database_can_load_into_memory_cache(tmp_path, monkeypatch):
 def test_writer_lock_timeout_preserves_existing_index(
     tmp_path, monkeypatch, incremental,
 ):
+    """Fail a competing write without replacing the previously committed vectors."""
     root = tmp_path / "project"
     root.mkdir()
     (root / "a.txt").write_text("text", encoding="utf-8")
@@ -176,6 +186,7 @@ def test_writer_lock_timeout_preserves_existing_index(
         connect = cache._connect
 
         def no_wait(path, **kwargs):
+            """Make contention fail immediately while retaining the real SQLite connection."""
             conn = connect(path, **kwargs)
             conn.execute("PRAGMA busy_timeout = 0;")
             return conn
@@ -201,6 +212,7 @@ def test_writer_lock_timeout_preserves_existing_index(
 
 @pytest.mark.parametrize("command", ["index", "search", "json", "clear"])
 def test_cli_reports_cache_write_timeout_without_traceback(tmp_path, monkeypatch, command):
+    """Report real lock contention with retry guidance and preserve JSON stdout."""
     from typer.testing import CliRunner
 
     from vexor import cli, config
@@ -217,11 +229,13 @@ def test_cli_reports_cache_write_timeout_without_traceback(tmp_path, monkeypatch
         connect = cache._connect
 
         def no_wait(path, **kwargs):
+            """Make contention fail immediately while retaining the real SQLite connection."""
             conn = connect(path, **kwargs)
             conn.execute("PRAGMA busy_timeout = 0;")
             return conn
 
         def write_index(*args, **kwargs):
+            """Exercise a real cache write from the stubbed CLI service entry point."""
             cache.store_index(**_options(root), entries=[_entry(root, 2.0)])
 
         monkeypatch.setattr(cache, "_connect", no_wait)
@@ -250,6 +264,7 @@ def test_cli_reports_cache_write_timeout_without_traceback(tmp_path, monkeypatch
 
 
 def test_cli_timeout_from_embedding_cache_has_retry_hint(tmp_path, monkeypatch):
+    """Handle contention before index publication in the real build orchestration."""
     import importlib
 
     import numpy as np
@@ -259,9 +274,11 @@ def test_cli_timeout_from_embedding_cache_has_retry_hint(tmp_path, monkeypatch):
 
     class OfflineSearcher:
         def __init__(self, **kwargs):
+            """Accept production searcher options without loading a model."""
             pass
 
         def embed_texts(self, labels):
+            """Supply deterministic vectors while keeping embedding-cache writes real."""
             return np.ones((len(labels), 2), dtype=np.float32)
 
     root, peer = tmp_path / "new-project", tmp_path / "peer"
@@ -280,6 +297,7 @@ def test_cli_timeout_from_embedding_cache_has_retry_hint(tmp_path, monkeypatch):
         connect = cache._connect
 
         def no_wait(path, **kwargs):
+            """Make contention fail immediately while retaining the real SQLite connection."""
             conn = connect(path, **kwargs)
             conn.execute("PRAGMA busy_timeout = 0;")
             return conn
@@ -301,6 +319,7 @@ def test_cli_timeout_from_embedding_cache_has_retry_hint(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("command", ["index", "search", "json"])
 def test_cli_does_not_relabel_other_sqlite_errors_as_busy(tmp_path, monkeypatch, command):
+    """Propagate an invalid SQL query instead of suggesting a misleading busy retry."""
     from contextlib import closing
 
     from typer.testing import CliRunner
@@ -310,6 +329,7 @@ def test_cli_does_not_relabel_other_sqlite_errors_as_busy(tmp_path, monkeypatch,
     monkeypatch.setenv("VEXOR_CONFIG_JSON", '{"provider":"local","model":"model"}')
 
     def invalid_query(*args, **kwargs):
+        """Raise a real SQLite error unrelated to writer contention."""
         with closing(sqlite3.connect(":memory:")) as conn:
             conn.execute("SELECT nonexistent_column")
 
@@ -325,8 +345,64 @@ def test_cli_does_not_relabel_other_sqlite_errors_as_busy(tmp_path, monkeypatch,
     assert "retry" not in result.output
 
 
+def test_metadata_read_handles_index_cleared_mid_read(tmp_path, monkeypatch):
+    """Report an absent index when another connection clears it during metadata loading."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "a.txt").write_text("text", encoding="utf-8")
+    with cache.cache_dir_context(tmp_path / "cache"):
+        cache.store_index(**_options(root), entries=[_entry(root, 1.0)])
+        connect = cache._connect
+        cleared = False
+
+        class ClearAfterFetch:
+            """Release the metadata cursor before clearing through another connection."""
+
+            def __init__(self, cursor):
+                """Keep the real SQLite cursor for the scheduled metadata read."""
+                self.cursor = cursor
+
+            def fetchone(self):
+                """Return a real row after another connection commits index clearing."""
+                nonlocal cleared
+                row = self.cursor.fetchone()
+                assert cache.clear_index(root, False, "name", True, model="model") == 1
+                cleared = True
+                return row
+
+        class InterleavedReader:
+            """Schedule clearing at the first metadata read using a real connection."""
+
+            def __init__(self, conn):
+                """Retain the read-only SQLite connection used by production loading."""
+                self.conn = conn
+
+            def execute(self, query, *args):
+                """Intercept metadata fetching while leaving all SQL execution real."""
+                cursor = self.conn.execute(query, *args)
+                if "FROM index_metadata" in query and "cache_key = ?" in query:
+                    return ClearAfterFetch(cursor)
+                return cursor
+
+            def close(self):
+                """Close the underlying reader when production loading exits."""
+                self.conn.close()
+
+        def interleaved_connect(path, **kwargs):
+            """Wrap only readers so index clearing uses an ordinary writer connection."""
+            conn = connect(path, **kwargs)
+            return InterleavedReader(conn) if kwargs.get("readonly") else conn
+
+        monkeypatch.setattr(cache, "_connect", interleaved_connect)
+        with pytest.raises(FileNotFoundError) as error:
+            cache.load_index(root, "model", False, "name", True)
+        assert cleared
+        assert error.value.args == (cache.cache_db_path(),)
+
+
 @pytest.mark.parametrize("empty", [False, True])
 def test_committed_missing_sidecar_is_damage_not_missing_index(tmp_path, empty):
+    """Distinguish damaged committed generations from genuinely absent indexes."""
     root = tmp_path / "project"
     root.mkdir()
     (root / "a.txt").write_text("text", encoding="utf-8")
@@ -345,6 +421,7 @@ def test_committed_missing_sidecar_is_damage_not_missing_index(tmp_path, empty):
 
 @pytest.mark.parametrize("command", ["index", "show", "search", "json"])
 def test_cli_reports_committed_sidecar_damage_and_can_clear(tmp_path, monkeypatch, command):
+    """Expose damaged-index recovery for each output mode and permit explicit clearing."""
     from typer.testing import CliRunner
 
     from vexor import cli, config
