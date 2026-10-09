@@ -28,6 +28,25 @@ def _entry(root: Path, value: float) -> cache.IndexedChunk:
     return cache.IndexedChunk(root / "a.txt", "a.txt", 0, "text", [value, 1.0])
 
 
+def _replace_generation(root: Path, update: str, value: float = 2.0) -> None:
+    """Commit a real replacement and release Windows mmaps before pruning its old file."""
+    if update == "full":
+        cache.store_index(**_options(root), entries=[_entry(root, value)])
+    elif update == "incremental":
+        cache.apply_index_updates(
+            **_options(root),
+            ordered_entries=[("a.txt", 0), ("b.txt", 0)],
+            changed_entries=[
+                _entry(root, value),
+                cache.IndexedChunk(root / "b.txt", "b.txt", 0, "text", [value + 1.0, 1.0]),
+            ],
+            removed_rel_paths=[],
+        )
+        cache._prune_unreferenced_vector_files(cache.cache_db_path())
+    else:
+        assert cache.clear_index(root, False, "name", True, model="model") == 1
+
+
 def _write_paused(cache_dir, root, incremental, stage, paused, release):
     """Hold a writer at a sidecar publication stage until the parent releases it."""
     with cache.cache_dir_context(cache_dir):
@@ -417,6 +436,132 @@ def test_committed_missing_sidecar_is_damage_not_missing_index(tmp_path, empty):
             with pytest.raises(RuntimeError, match="vexor index --clear") as error:
                 load()
             assert str(sidecar) in str(error.value)
+
+
+@pytest.mark.parametrize("reader", ["load_index", "load_index_vectors"])
+@pytest.mark.parametrize("update", ["full", "incremental", "clear"])
+def test_replaced_sidecar_is_not_reported_as_damage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str, update: str,
+) -> None:
+    """Replace a real generation before file checking and distinguish it from damage."""
+    root = tmp_path / "project"
+    root.mkdir()
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text("text", encoding="utf-8")
+    with cache.cache_dir_context(tmp_path / "cache"):
+        cache.store_index(**_options(root), entries=[_entry(root, 1.0)])
+        require = cache._require_vector_file
+        updated = False
+
+        def update_before_check(db_path: Path, stored_path: str, **kwargs) -> Path:
+            """Perform one committed rewrite before the reader checks its old sidecar."""
+            nonlocal updated
+            if not updated:
+                updated = True
+                _replace_generation(root, update)
+            return require(db_path, stored_path, **kwargs)
+
+        monkeypatch.setattr(cache, "_require_vector_file", update_before_check)
+        load = getattr(cache, reader)
+        if update == "incremental":
+            loaded = load(root, "model", False, "name", True)
+            if reader == "load_index":
+                assert [chunk["path"] for chunk in loaded["chunks"]] == ["a.txt", "b.txt"]
+            else:
+                paths, vectors, metadata = loaded
+                assert paths == [root / "a.txt", root / "b.txt"]
+                assert vectors.tolist() == [[2.0, 1.0], [3.0, 1.0]]
+                assert len(metadata["chunk_ids"]) == 2
+        else:
+            with pytest.raises(FileNotFoundError):
+                load(root, "model", False, "name", True)
+        assert updated
+        if update != "clear":
+            _, current, _ = cache.load_index_vectors(root, "model", False, "name", True)
+            assert current.tolist() == (
+                [[2.0, 1.0], [3.0, 1.0]] if update == "incremental" else [[2.0, 1.0]]
+            )
+
+
+@pytest.mark.parametrize("update", ["full", "incremental", "clear"])
+def test_replacement_between_file_check_and_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, update: str,
+) -> None:
+    """Let pruning remove the checked file immediately before NumPy opens it."""
+    root = tmp_path / "project"
+    root.mkdir()
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text("text", encoding="utf-8")
+    with cache.cache_dir_context(tmp_path / "cache"):
+        cache.store_index(**_options(root), entries=[_entry(root, 1.0)])
+        load = cache.np.load
+        updated = False
+
+        def update_before_open(*args, **kwargs):
+            """Open actual arrays after one writer removes the reader's observed file."""
+            nonlocal updated
+            if not updated:
+                updated = True
+                _replace_generation(root, update)
+            return load(*args, **kwargs)
+
+        monkeypatch.setattr(cache.np, "load", update_before_open)
+        if update == "incremental":
+            _, vectors, metadata = cache.load_index_vectors(root, "model", False, "name", True)
+            assert vectors.tolist() == [[2.0, 1.0], [3.0, 1.0]]
+            assert len(metadata["chunk_ids"]) == 2
+        else:
+            with pytest.raises(FileNotFoundError):
+                cache.load_index_vectors(root, "model", False, "name", True)
+        assert updated
+
+
+@pytest.mark.parametrize("reader", ["load_index", "load_index_vectors"])
+def test_replacement_retry_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str,
+) -> None:
+    """Stop after one complete retry while retaining the writer's healthy generation."""
+    root = tmp_path / "project"
+    root.mkdir()
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text("text", encoding="utf-8")
+    with cache.cache_dir_context(tmp_path / "cache"):
+        cache.store_index(**_options(root), entries=[_entry(root, 1.0)])
+        require = cache._require_vector_file
+        attempts = 0
+
+        def replace_each_read(db_path: Path, stored_path: str, **kwargs) -> Path:
+            """Replace only reader generations; leave the updater's locked read alone."""
+            nonlocal attempts
+            if kwargs.get("index_id") is not None:
+                attempts += 1
+                assert attempts <= 2
+                _replace_generation(root, "incremental", float(attempts + 1))
+            return require(db_path, stored_path, **kwargs)
+
+        monkeypatch.setattr(cache, "_require_vector_file", replace_each_read)
+        with pytest.raises(FileNotFoundError) as error:
+            getattr(cache, reader)(root, "model", False, "name", True)
+        assert type(error.value) is FileNotFoundError
+        assert attempts == 2
+        monkeypatch.setattr(cache, "_require_vector_file", require)
+        _, current, _ = cache.load_index_vectors(root, "model", False, "name", True)
+        assert current.tolist() == [[3.0, 1.0], [4.0, 1.0]]
+
+
+def test_invalid_sidecar_is_not_retried_as_replacement(tmp_path: Path) -> None:
+    """Preserve the invalid-array error when the committed file exists but is corrupt."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "a.txt").write_text("text", encoding="utf-8")
+    with cache.cache_dir_context(tmp_path / "cache"):
+        cache.store_index(**_options(root), entries=[_entry(root, 1.0)])
+        sidecar = next((tmp_path / "cache" / "vectors").glob("*.npy"))
+        sidecar.write_bytes(b"not a numpy array")
+        with pytest.raises(RuntimeError) as error:
+            cache.load_index_vectors(root, "model", False, "name", True)
+        assert str(sidecar) in str(error.value)
+        assert isinstance(error.value.__cause__, ValueError)
 
 
 @pytest.mark.parametrize("command", ["index", "show", "search", "json"])

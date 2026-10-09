@@ -7,13 +7,15 @@ import os
 import sqlite3
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from threading import Lock
+from typing import ParamSpec, TypeVar
 
 import numpy as np
 
@@ -40,6 +42,33 @@ EMBED_MEMORY_CACHE_MAX_ENTRIES = 2_048
 
 class DamagedIndexError(RuntimeError):
     """Committed index metadata references a missing vector sidecar."""
+
+
+class _IndexGenerationChanged(FileNotFoundError):
+    """The observed index ID now references a different immutable sidecar."""
+
+
+_LoadArgs = ParamSpec("_LoadArgs")
+_LoadResult = TypeVar("_LoadResult")
+
+
+def _retry_replaced_generation(
+    load: Callable[_LoadArgs, _LoadResult],
+) -> Callable[_LoadArgs, _LoadResult]:
+    """Retry a replaced generation once, after the failed reader closes its connection."""
+
+    @wraps(load)
+    def read_current(*args: _LoadArgs.args, **kwargs: _LoadArgs.kwargs) -> _LoadResult:
+        """Restart the complete read and bound retries under continuous replacement."""
+        try:
+            return load(*args, **kwargs)
+        except _IndexGenerationChanged:
+            try:
+                return load(*args, **kwargs)
+            except _IndexGenerationChanged as exc:
+                raise FileNotFoundError(*exc.args) from exc
+
+    return read_current
 
 
 _EMBED_MEMORY_CACHE: OrderedDict[tuple[str, str, int | None, str], np.ndarray] = (
@@ -615,10 +644,21 @@ def _write_vector_file(
     return final_path.relative_to(db_path.parent).as_posix()
 
 
-def _require_vector_file(db_path: Path, stored_path: str) -> Path:
-    """Resolve a committed sidecar, reporting damage rather than an absent index."""
+def _require_vector_file(
+    db_path: Path, stored_path: str, *, index_id: int | None = None,
+) -> Path:
+    """Report damage only while the observed generation still references a missing file."""
     vector_path = _resolve_vector_file(db_path, stored_path)
     if not vector_path.is_file():
+        if index_id is not None:
+            with closing(_connect(db_path, readonly=True)) as conn:
+                current = conn.execute(
+                    "SELECT vector_file FROM index_metadata WHERE id = ?", (index_id,)
+                ).fetchone()
+            if current is None:
+                raise FileNotFoundError(db_path)
+            if str(current["vector_file"]) != stored_path:
+                raise _IndexGenerationChanged(db_path)
         raise DamagedIndexError(
             Messages.ERROR_CACHE_VECTOR_FILE_MISSING.format(vector_path=vector_path)
         )
@@ -631,12 +671,17 @@ def _load_vector_file(
     *,
     rows: int,
     dimension: int,
+    index_id: int | None = None,
 ) -> np.ndarray:
     """Load a sidecar and reject missing files, invalid arrays, or shape mismatches."""
-    vector_path = _require_vector_file(db_path, stored_path)
+    vector_path = _require_vector_file(db_path, stored_path, index_id=index_id)
     try:
         mmap_mode = None if rows == 0 else "r"
         vectors = np.load(vector_path, mmap_mode=mmap_mode, allow_pickle=False)
+    except FileNotFoundError:
+        # Pruning can win between the presence check and opening the file.
+        _require_vector_file(db_path, stored_path, index_id=index_id)
+        raise
     except (OSError, ValueError) as exc:
         raise RuntimeError(
             Messages.ERROR_CACHE_VECTOR_FILE_INVALID.format(vector_path=vector_path)
@@ -1263,6 +1308,7 @@ def backfill_chunk_lines(
         conn.close()
 
 
+@_retry_replaced_generation
 def load_index(
     root: Path,
     model: str,
@@ -1321,7 +1367,7 @@ def load_index(
         ).fetchone()
         if vector_row is None:
             raise FileNotFoundError(db_path)
-        _require_vector_file(db_path, str(vector_row["vector_file"]))
+        _require_vector_file(db_path, str(vector_row["vector_file"]), index_id=int(meta["id"]))
 
         rows = conn.execute(
             """
@@ -1389,6 +1435,7 @@ def load_index(
         conn.close()
 
 
+@_retry_replaced_generation
 def load_index_vectors(
     root: Path,
     model: str,
@@ -1451,7 +1498,7 @@ def load_index_vectors(
 
         index_id = meta["id"]
         dimension = int(meta["dimension"])
-        _require_vector_file(db_path, str(meta["vector_file"]))
+        _require_vector_file(db_path, str(meta["vector_file"]), index_id=int(index_id))
         memory_key = (
             str(db_path.resolve()),
             model,
@@ -1502,6 +1549,7 @@ def load_index_vectors(
             str(meta["vector_file"]),
             rows=chunk_total,
             dimension=dimension,
+            index_id=int(index_id),
         )
         paths: list[Path] = []
         chunk_ids: list[int] = []
