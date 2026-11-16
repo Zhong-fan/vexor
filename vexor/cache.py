@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from threading import Lock
@@ -869,7 +869,7 @@ def store_index(
             extensions,
             exclude_patterns,
         )
-        generated_at = datetime.now(timezone.utc).isoformat()
+        generated_at = datetime.now(UTC).isoformat()
         dimension = int(
             np.asarray(entries[0].embedding, dtype=np.float32).size if entries else 0
         )
@@ -1172,7 +1172,7 @@ def apply_index_updates(
                         position_updates,
                     )
 
-            generated_at = datetime.now(timezone.utc).isoformat()
+            generated_at = datetime.now(UTC).isoformat()
             conn.execute(
                 """
                 UPDATE index_metadata
@@ -1293,7 +1293,7 @@ def backfill_chunk_lines(
                     """,
                     update_rows,
                 )
-            generated_at = datetime.now(timezone.utc).isoformat()
+            generated_at = datetime.now(UTC).isoformat()
             conn.execute(
                 """
                 UPDATE index_metadata
@@ -1822,7 +1822,7 @@ def store_query_vector(
     connection = conn or _connect(db_path)
     try:
         _ensure_schema(connection)
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
         vector_blob = np.asarray(query_vector, dtype=np.float32).tobytes()
         with connection:
             connection.execute(
@@ -1930,7 +1930,7 @@ def store_embedding_cache(
     connection = conn or _connect(db_path)
     try:
         _ensure_schema(connection)
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
         rows = [
             (
                 model,
@@ -1970,7 +1970,7 @@ def _prune_embedding_cache(
     now: datetime | None = None,
 ) -> None:
     if ttl_days > 0:
-        cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=ttl_days)
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=ttl_days)
         conn.execute(
             "DELETE FROM embedding_cache WHERE created_at < ?",
             (cutoff.isoformat(),),
